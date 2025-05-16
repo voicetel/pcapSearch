@@ -1,10 +1,13 @@
 package main
 
 import (
+	"compress/gzip"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -45,18 +48,22 @@ func main() {
 
 	// Custom usage message
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [options] file.pcap\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [options] file.pcap|file.pcap.gz\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		fs.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\nSupported file formats: .pcap, .pcap.gz, .gz\n")
 	}
 
-		// First, find the pcap file from the arguments
-		var pcapFile string
-		var args []string
-	
-		for _, arg := range os.Args[1:] {
-			if !strings.HasPrefix(arg, "-") && strings.HasSuffix(strings.ToLower(arg), ".pcap") {
-				pcapFile = arg
+	// First, find the pcap file from the arguments
+	var pcapFile string
+	var args []string
+
+	for _, arg := range os.Args[1:] {
+		if !strings.HasPrefix(arg, "-") &&
+			(strings.HasSuffix(strings.ToLower(arg), ".pcap") ||
+				strings.HasSuffix(strings.ToLower(arg), ".pcap.gz") ||
+				strings.HasSuffix(strings.ToLower(arg), ".gz")) {
+			pcapFile = arg
 		} else {
 			args = append(args, arg)
 		}
@@ -92,7 +99,7 @@ func main() {
 		CallID:       *callID,
 	}
 
-	// Print filter info for debugging
+	/* Print filter info for debugging
 	fmt.Println("Filter criteria:")
 	fmt.Printf("  Source Number: '%s'\n", filter.SourceNumber)
 	fmt.Printf("  Dest Number: '%s'\n", filter.DestNumber)
@@ -100,6 +107,7 @@ func main() {
 	fmt.Printf("  User Agent: '%s'\n", filter.UserAgent)
 	fmt.Printf("  IP Address: '%s'\n", filter.IPAddress)
 	fmt.Printf("  Call ID: '%s'\n", filter.CallID)
+	*/
 
 	// Check if any filter was provided
 	if filter.isEmpty() {
@@ -109,6 +117,9 @@ func main() {
 	}
 
 	fmt.Printf("Processing PCAP file: %s\n", pcapFile)
+	if strings.HasSuffix(strings.ToLower(pcapFile), ".gz") {
+		fmt.Println("Detected compressed gzip file - will uncompress automatically")
+	}
 
 	// Process the PCAP file
 	matchingPackets, err := processPCAP(pcapFile, filter)
@@ -136,15 +147,74 @@ func main() {
 	fmt.Printf("Found %d matching packets. Output saved to %s\n", len(matchingPackets), tempPCAP)
 }
 
-// isEmpty checks if the filter has any criteria set
+// uncompressGzipFile takes a gzip file path and returns the path to a temporary
+// uncompressed file. The caller is responsible for removing the temporary file.
+func uncompressGzipFile(gzipFilePath string) (string, error) {
+	// Open the gzip file
+	gzipFile, err := os.Open(gzipFilePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to open gzip file: %v", err)
+	}
+	defer gzipFile.Close()
+
+	// Create a gzip reader
+	gzipReader, err := gzip.NewReader(gzipFile)
+	if err != nil {
+		return "", fmt.Errorf("failed to create gzip reader: %v", err)
+	}
+	defer gzipReader.Close()
+
+	// Create a temporary file to hold the uncompressed data
+	// We'll use the original filename without the .gz extension if possible
+	baseFilename := filepath.Base(gzipFilePath)
+	if strings.HasSuffix(baseFilename, ".gz") {
+		baseFilename = strings.TrimSuffix(baseFilename, ".gz")
+	}
+
+	tempFile, err := os.CreateTemp("", "uncompressed-"+baseFilename)
+	if err != nil {
+		return "", fmt.Errorf("failed to create temporary file: %v", err)
+	}
+	defer tempFile.Close()
+
+	// Copy the uncompressed data to the temporary file
+	_, err = io.Copy(tempFile, gzipReader)
+	if err != nil {
+		// Clean up the temp file if we encounter an error
+		os.Remove(tempFile.Name())
+		return "", fmt.Errorf("failed to uncompress data: %v", err)
+	}
+
+	fmt.Printf("Successfully uncompressed %s to temporary file\n", gzipFilePath)
+	return tempFile.Name(), nil
+}
 func (f Filter) isEmpty() bool {
 	return f.SourceNumber == "" && f.DestNumber == "" && f.User == "" && f.UserAgent == "" && f.IPAddress == "" && f.CallID == ""
 }
 
 // processPCAP processes the PCAP file with the given filter
 func processPCAP(filename string, filter Filter) ([]PacketResult, error) {
-	// Open the PCAP file
-	handle, err := pcap.OpenOffline(filename)
+	var handle *pcap.Handle
+	var err error
+
+	// Check if the file is compressed with gzip
+	isCompressed := strings.HasSuffix(strings.ToLower(filename), ".gz")
+
+	if isCompressed {
+		// Create a temporary file to hold the uncompressed data
+		tempFile, err := uncompressGzipFile(filename)
+		if err != nil {
+			return nil, fmt.Errorf("error uncompressing gzip file: %v", err)
+		}
+		defer os.Remove(tempFile) // Clean up the temporary file when done
+
+		// Open the uncompressed temporary pcap file
+		handle, err = pcap.OpenOffline(tempFile)
+	} else {
+		// Open the regular pcap file
+		handle, err = pcap.OpenOffline(filename)
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("error opening pcap file: %v", err)
 	}
