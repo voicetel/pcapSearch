@@ -76,10 +76,10 @@ Before you begin, make sure you have the following software installed:
 1. Open Command Prompt as Administrator
 2. Navigate to the pcapSearch directory
 3. Install required Go packages:
-  ```bash
-  go mod init github.com/voicetel/pcapSearch
-  go mod tidy
-  ```
+   ```bash
+   go mod init github.com/voicetel/pcapSearch
+   go mod tidy
+   ```
 4. Set environment variables to locate Npcap/WinPcap:
 
    For Npcap (64-bit):
