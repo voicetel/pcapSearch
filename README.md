@@ -57,6 +57,10 @@ go mod tidy
 go build pcapSearch.go
 ```
 
+### Windows
+
+Windows [instructions](windows.md).
+
 ## Usage
 
 ```
