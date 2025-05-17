@@ -225,10 +225,6 @@ func buildBPFFilter(filter Filter) string {
 		filters = append(filters, fmt.Sprintf("host %s", filter.IPAddress))
 	}
 
-	// Always filter for potential SIP traffic (common SIP ports)
-	// SIP typically uses port 5060 for non-encrypted and 5061 for TLS
-	filters = append(filters, "(port 5060 or port 5061)")
-
 	// Combine all filters with AND
 	return strings.Join(filters, " and ")
 }
