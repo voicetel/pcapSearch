@@ -75,10 +75,10 @@ func main() {
 
 	// Custom usage message
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [options] file.pcap|file.pcap.gz\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [options] file.pcap|file.pcapng|file.pcap.gz|file.pcapng.gz\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		fs.PrintDefaults()
-		fmt.Fprintf(os.Stderr, "\nSupported file formats: .pcap, .pcap.gz, .gz\n")
+		fmt.Fprintf(os.Stderr, "\nSupported file formats: .pcap, .pcapng, .pcap.gz, .pcapng.gz, .gz\n")
 	}
 
 	// First, find the pcap file from the arguments
@@ -88,7 +88,9 @@ func main() {
 	for _, arg := range os.Args[1:] {
 		if !strings.HasPrefix(arg, "-") &&
 			(strings.HasSuffix(strings.ToLower(arg), ".pcap") ||
+				strings.HasSuffix(strings.ToLower(arg), ".pcapng") ||
 				strings.HasSuffix(strings.ToLower(arg), ".pcap.gz") ||
+				strings.HasSuffix(strings.ToLower(arg), ".pcapng.gz") ||
 				strings.HasSuffix(strings.ToLower(arg), ".gz")) {
 			pcapFile = arg
 		} else {
@@ -108,15 +110,26 @@ func main() {
 
 	// Check if a pcap file was found
 	if pcapFile == "" {
-		fmt.Println("Error: No PCAP file specified")
+		fmt.Println("Error: No capture file specified")
 		fs.Usage()
 		os.Exit(1)
 	}
 
-	// Verify the pcap file exists
+	// Verify the pcap file exists and check format
 	if _, err := os.Stat(pcapFile); os.IsNotExist(err) {
-		fmt.Printf("Error: PCAP file %s does not exist\n", pcapFile)
+		fmt.Printf("Error: Capture file %s does not exist\n", pcapFile)
 		os.Exit(1)
+	}
+
+	// Detect file format
+	fileFormat := detectFileFormat(pcapFile)
+	if verbose {
+		fmt.Printf("Detected file format: %s\n", fileFormat)
+	}
+
+	// Verify the format is supported
+	if fileFormat == "unknown" || fileFormat == "unknown.gz" {
+		fmt.Printf("Warning: Unrecognized capture file format. Attempting to process anyway.\n")
 	}
 
 	// Create filter criteria
@@ -134,6 +147,17 @@ func main() {
 		fmt.Println("Error: No filter criteria specified")
 		fs.Usage()
 		os.Exit(1)
+	}
+
+	// If verbose mode is on, print filter criteria
+	if verbose {
+		fmt.Println("\nFilter criteria:")
+		fmt.Printf("  Source Number: '%s'\n", filter.SourceNumber)
+		fmt.Printf("  Dest Number: '%s'\n", filter.DestNumber)
+		fmt.Printf("  User: '%s'\n", filter.User)
+		fmt.Printf("  User Agent: '%s'\n", filter.UserAgent)
+		fmt.Printf("  IP Address: '%s'\n", filter.IPAddress)
+		fmt.Printf("  Call ID: '%s'\n", filter.CallID)
 	}
 
 	// Convert workers from string to int, handling auto and percentage modes
@@ -210,12 +234,13 @@ func main() {
 		}
 	}
 
-	fmt.Printf("Processing PCAP file: %s\n", pcapFile)
+	fmt.Printf("Processing capture file: %s\n", pcapFile)
 	if verbose {
 		fmt.Printf("Using %d worker threads\n", numWorkers)
-		if strings.HasSuffix(strings.ToLower(pcapFile), ".gz") {
-			fmt.Println("Detected compressed gzip file - will uncompress automatically")
-		}
+	}
+
+	if strings.HasSuffix(strings.ToLower(pcapFile), ".gz") {
+		logVerbose("Detected compressed gzip file - will uncompress automatically\n")
 	}
 
 	// Setting output file
@@ -262,7 +287,7 @@ func main() {
 	processingTime := time.Since(startTime)
 
 	if err != nil {
-		log.Fatalf("Error processing PCAP file: %v", err)
+		log.Fatalf("Error processing capture file: %v", err)
 	}
 
 	// Check if any matches were found
@@ -291,6 +316,80 @@ func logVerbose(format string, args ...interface{}) {
 	if verbose {
 		fmt.Printf(format, args...)
 	}
+}
+
+// detectFileFormat detects the format of a capture file
+func detectFileFormat(filename string) string {
+	// Check if the file is gzipped
+	if strings.HasSuffix(strings.ToLower(filename), ".gz") {
+		baseName := strings.TrimSuffix(strings.ToLower(filename), ".gz")
+		if strings.HasSuffix(baseName, ".pcapng") {
+			return "pcapng.gz"
+		} else if strings.HasSuffix(baseName, ".pcap") {
+			return "pcap.gz"
+		} else {
+			return "unknown.gz"
+		}
+	}
+
+	// Check file signature for non-gzipped files
+	isPcapNG, err := isPcapNGFile(filename)
+	if err == nil && isPcapNG {
+		return "pcapng"
+	}
+
+	// Default to pcap or determine by extension
+	if strings.HasSuffix(strings.ToLower(filename), ".pcapng") {
+		return "pcapng"
+	} else if strings.HasSuffix(strings.ToLower(filename), ".pcap") {
+		return "pcap"
+	}
+
+	return "unknown"
+}
+
+// isPcapNGFile checks if the file is a PCAPNG format file based on the signature
+func isPcapNGFile(filename string) (bool, error) {
+	// PCAPNG format signature: 0x0A0D0D0A (Block Type: Section Header Block)
+	file, err := os.Open(filename)
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+
+	// Read first 4 bytes to check signature
+	signature := make([]byte, 4)
+	n, err := file.Read(signature)
+	if err != nil || n < 4 {
+		return false, err
+	}
+
+	// Check for PCAPNG signature (0x0A0D0D0A)
+	return signature[0] == 0x0A && signature[1] == 0x0D && signature[2] == 0x0D && signature[3] == 0x0A, nil
+}
+
+// openPcapFile opens a PCAP or PCAPNG file and returns a packet source
+func openPcapFile(filename string) (*pcap.Handle, error) {
+	// Check if file is PCAPNG format
+	isPcapNG, err := isPcapNGFile(filename)
+	if err != nil {
+		// If we can't determine the format, try to open it anyway
+		logVerbose("Could not determine if file is PCAPNG format: %v\n", err)
+	} else if isPcapNG {
+		logVerbose("Detected PCAPNG format file\n")
+		// libpcap 1.5.0 and later support PCAPNG format directly
+		// Fall through to OpenOffline which should handle it
+	} else {
+		logVerbose("Detected legacy PCAP format file\n")
+	}
+
+	// Open the file using libpcap/gopacket
+	handle, err := pcap.OpenOffline(filename)
+	if err != nil {
+		return nil, fmt.Errorf("error opening capture file: %v", err)
+	}
+
+	return handle, nil
 }
 
 // uncompressGzipFile takes a gzip file path and returns the path to a temporary
@@ -402,7 +501,7 @@ func processPCAP(filename string, filter Filter, numWorkers int) ([]PacketResult
 	}
 
 	// Open the pcap file
-	handle, err = pcap.OpenOffline(pcapPath)
+	handle, err = openPcapFile(pcapPath)
 	if err != nil {
 		return nil, fmt.Errorf("error opening pcap file: %v", err)
 	}
@@ -495,7 +594,7 @@ func processPCAPStreaming(filename string, filter Filter, outputFile string, num
 	}
 
 	// Open the pcap file
-	handle, err = pcap.OpenOffline(pcapPath)
+	handle, err = openPcapFile(pcapPath)
 	if err != nil {
 		return 0, fmt.Errorf("error opening pcap file: %v", err)
 	}
@@ -722,6 +821,16 @@ func writePacketsToFile(filename string, packets []PacketResult) error {
 	}
 	defer f.Close()
 
+	// Determine if we should use PCAPNG format for output based on the output filename
+	usePcapNG := strings.HasSuffix(strings.ToLower(filename), ".pcapng")
+
+	if usePcapNG {
+		// Create a pcapng writer (when supported)
+		// Note: Current gopacket version doesn't have direct pcapng writer support
+		// For now, we'll use pcap format but with the .pcapng extension
+		logVerbose("Writing output in pcap format (with .pcapng extension)\n")
+	}
+
 	// Create a pcap writer
 	writer := pcapgo.NewWriter(f)
 	err = writer.WriteFileHeader(65536, layers.LinkTypeEthernet)
@@ -796,7 +905,7 @@ func processPCAPChunked(filename string, filter Filter, outputFile string, numWo
 
 	for {
 		// Open the pcap file for this chunk
-		handle, err = pcap.OpenOffline(pcapPath)
+		handle, err = openPcapFile(pcapPath)
 		if err != nil {
 			return 0, fmt.Errorf("error opening pcap file: %v", err)
 		}
@@ -953,7 +1062,7 @@ func processPCAPChunked(filename string, filter Filter, outputFile string, numWo
 
 // countPacketsInFile counts the total number of packets in a pcap file
 func countPacketsInFile(filename string) (int, error) {
-	handle, err := pcap.OpenOffline(filename)
+	handle, err := openPcapFile(filename)
 	if err != nil {
 		return 0, err
 	}
@@ -1068,7 +1177,7 @@ func mergeChunkFiles(files []string, writer *pcapgo.Writer) error {
 
 	// Open all files first
 	for i, file := range files {
-		handle, err := pcap.OpenOffline(file)
+		handle, err := openPcapFile(file)
 		if err != nil {
 			// Close already opened handles
 			for j := 0; j < i; j++ {
