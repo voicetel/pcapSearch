@@ -245,19 +245,3 @@ If you continue to have issues, please:
 2. Check that your Npcap/WinPcap installation is working using a tool like Wireshark
 
 3. Create an issue on the project repository with details about the error and your setup
-
-## Creating Capture Files on Windows
-
-If you need to create your own capture files:
-
-### Using Wireshark
-1. Download and install Wireshark from [https://www.wireshark.org/](https://www.wireshark.org/)
-2. Select an interface and start capturing
-3. Save the file as .pcap or .pcapng
-
-### Using Npcap Command-Line Tools
-If you installed Npcap, you can use WinDump (the Windows version of tcpdump):
-```
-"C:\Program Files\Npcap\windump.exe" -i 3 -w capture.pcap
-```
-(Replace `3` with your interface number, which you can see by running `windump -D`)
