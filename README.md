@@ -152,6 +152,16 @@ go build pcapSearch.go
 ./pcapSearch capture.pcap -ip 10.0.0.100 -id "call-12345@bob.example.com"
 ```
 
+**Extract each call to a separate file**:
+```bash
+./pcapSearch capture.pcap -src "+15551234567" -split
+```
+
+**Search for multiple calls and organize them by Call-ID**:
+```bash
+./pcapSearch capture.pcapng -ip 10.0.0.100 -split
+```  -split
+    	Split output into separate files by Call-ID
 ## Processing Modes
 
 pcapSearch offers three processing modes, automatically selected based on file size:
