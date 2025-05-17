@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -49,6 +50,9 @@ const (
 	ChunkModeThreshold  = 2 * 1024 * 1024 * 1024 // 2GB
 )
 
+// Global verbose flag
+var verbose bool
+
 func main() {
 	// Create a custom flagset that doesn't require flags to be before arguments
 	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
@@ -61,16 +65,17 @@ func main() {
 	ipAddr := fs.String("ip", "", "Filter by IP Address")
 	callID := fs.String("id", "", "Filter by Call ID")
 	outputFile := fs.String("o", "", "Output PCAP file (default: timestamp.pcap)")
-	workers := fs.Int("workers", DefaultWorkers, "Number of worker goroutines (0 = use all CPU cores)")
+	workers := fs.String("workers", "0", "Number of worker goroutines (0 = use all CPU cores, N% = use percentage of cores)")
 	streamOutput := fs.Bool("stream", false, "Stream output directly to file (reduces memory usage)")
 	chunkMode := fs.Bool("chunk", false, "Use chunked processing for very large files (lowest memory usage)")
 	chunkSizeFlag := fs.Int("chunk-size", ChunkSize, "Number of packets per chunk in chunk mode")
 	forceMode := fs.Bool("force-mode", false, "Force the specified mode instead of auto-selecting based on file size")
 	autoMode := fs.Bool("auto", true, "Automatically select the best mode based on file size (default: true)")
+	verboseFlag := fs.Bool("v", false, "Verbose mode: display detailed processing information")
 
 	// Custom usage message
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s file.pcap [options]\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [options] file.pcap|file.pcap.gz\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		fs.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nSupported file formats: .pcap, .pcap.gz, .gz\n")
@@ -97,6 +102,9 @@ func main() {
 		fs.Usage()
 		os.Exit(1)
 	}
+
+	// Set global verbose flag
+	verbose = *verboseFlag
 
 	// Check if a pcap file was found
 	if pcapFile == "" {
@@ -128,8 +136,35 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Set the number of workers
-	numWorkers := *workers
+	// Convert workers from string to int, handling auto and percentage modes
+	numWorkers := DefaultWorkers
+	workersStr := *workers
+	if workersStr != "0" && workersStr != "" {
+		if strings.HasSuffix(workersStr, "%") {
+			// Handle percentage-based worker allocation
+			percentStr := strings.TrimSuffix(workersStr, "%")
+			percent, err := strconv.Atoi(percentStr)
+			if err != nil || percent <= 0 || percent > 100 {
+				fmt.Printf("Invalid worker percentage: %s, using default\n", workersStr)
+			} else {
+				availableCores := runtime.GOMAXPROCS(0)
+				numWorkers = availableCores * percent / 100
+				if numWorkers < 1 {
+					numWorkers = 1
+				}
+			}
+		} else {
+			// Handle explicit worker count
+			w, err := strconv.Atoi(workersStr)
+			if err != nil {
+				fmt.Printf("Invalid worker count: %s, using default\n", workersStr)
+			} else {
+				numWorkers = w
+			}
+		}
+	}
+
+	// If numWorkers is still 0 or negative, use all available cores
 	if numWorkers <= 0 {
 		numWorkers = runtime.GOMAXPROCS(0)
 	}
@@ -144,30 +179,43 @@ func main() {
 			if strings.HasSuffix(strings.ToLower(pcapFile), ".gz") {
 				estimatedUncompressedSize := fileSize * 3
 				fileSize = estimatedUncompressedSize
+				if verbose {
+					fmt.Printf("Compressed file detected. Original size: %.2f MB, Estimated uncompressed: %.2f MB\n",
+						float64(fileInfo.Size())/(1024*1024), float64(fileSize)/(1024*1024))
+				}
 			}
 
 			// Auto-select the appropriate mode based on file size
 			if fileSize > ChunkModeThreshold {
 				*chunkMode = true
 				*streamOutput = false
-				fmt.Printf("Auto-selected: Chunk mode for large file (%.2f GB)\n", float64(fileSize)/(1024*1024*1024))
+				if verbose {
+					fmt.Printf("Auto-selected: Chunk mode for large file (%.2f GB)\n", float64(fileSize)/(1024*1024*1024))
+				}
 			} else if fileSize > StreamModeThreshold {
 				*chunkMode = false
 				*streamOutput = true
-				fmt.Printf("Auto-selected: Stream mode for medium file (%.2f MB)\n", float64(fileSize)/(1024*1024))
+				if verbose {
+					fmt.Printf("Auto-selected: Stream mode for medium file (%.2f MB)\n", float64(fileSize)/(1024*1024))
+				}
 			} else {
 				*chunkMode = false
 				*streamOutput = false
-				fmt.Printf("Auto-selected: Standard mode for small file (%.2f MB)\n", float64(fileSize)/(1024*1024))
+				if verbose {
+					fmt.Printf("Auto-selected: Standard mode for small file (%.2f MB)\n", float64(fileSize)/(1024*1024))
+				}
 			}
-		} else {
+		} else if verbose {
 			fmt.Printf("Warning: Could not determine file size, using specified or default mode: %v\n", err)
 		}
 	}
 
-	fmt.Printf("Processing PCAP file: %s with %d workers\n", pcapFile, numWorkers)
-	if strings.HasSuffix(strings.ToLower(pcapFile), ".gz") {
-		fmt.Println("Detected compressed gzip file - will uncompress automatically")
+	fmt.Printf("Processing PCAP file: %s\n", pcapFile)
+	if verbose {
+		fmt.Printf("Using %d worker threads\n", numWorkers)
+		if strings.HasSuffix(strings.ToLower(pcapFile), ".gz") {
+			fmt.Println("Detected compressed gzip file - will uncompress automatically")
+		}
 	}
 
 	// Setting output file
@@ -183,12 +231,14 @@ func main() {
 	startTime := time.Now()
 
 	// Print which mode is being used
-	if *chunkMode {
-		fmt.Println("Using: Chunk mode (lowest memory usage, good for extremely large files)")
-	} else if *streamOutput {
-		fmt.Println("Using: Stream mode (balanced memory usage and performance)")
-	} else {
-		fmt.Println("Using: Standard mode (fastest for smaller files)")
+	if verbose {
+		if *chunkMode {
+			fmt.Println("Using: Chunk mode (lowest memory usage, good for extremely large files)")
+		} else if *streamOutput {
+			fmt.Println("Using: Stream mode (balanced memory usage and performance)")
+		} else {
+			fmt.Println("Using: Standard mode (fastest for smaller files)")
+		}
 	}
 
 	if *chunkMode {
@@ -223,6 +273,24 @@ func main() {
 
 	fmt.Printf("Found %d matching packets in %v. Output saved to %s\n",
 		matchCount, processingTime, tempPCAP)
+
+	// Print performance statistics if verbose
+	if verbose {
+		packetsPerSecond := float64(matchCount) / processingTime.Seconds()
+		fmt.Printf("\nPerformance statistics:\n")
+		fmt.Printf("  Processing mode: %s\n",
+			map[bool]string{true: "Chunked", false: map[bool]string{true: "Streaming", false: "Standard"}[*streamOutput]}[*chunkMode])
+		fmt.Printf("  Workers: %d\n", numWorkers)
+		fmt.Printf("  Processing time: %.2f seconds\n", processingTime.Seconds())
+		fmt.Printf("  Processing rate: %.1f packets/second\n", packetsPerSecond)
+	}
+}
+
+// logVerbose prints a message only when verbose mode is enabled
+func logVerbose(format string, args ...interface{}) {
+	if verbose {
+		fmt.Printf(format, args...)
+	}
 }
 
 // uncompressGzipFile takes a gzip file path and returns the path to a temporary
@@ -255,15 +323,34 @@ func uncompressGzipFile(gzipFilePath string) (string, error) {
 	}
 	defer tempFile.Close()
 
+	// Get the initial size to calculate compression ratio
+	initialSize := 0
+	if verbose {
+		fileInfo, err := gzipFile.Stat()
+		if err == nil {
+			initialSize = int(fileInfo.Size())
+		}
+	}
+
 	// Copy the uncompressed data to the temporary file
-	_, err = io.Copy(tempFile, gzipReader)
+	written, err := io.Copy(tempFile, gzipReader)
 	if err != nil {
 		// Clean up the temp file if we encounter an error
 		os.Remove(tempFile.Name())
 		return "", fmt.Errorf("failed to uncompress data: %v", err)
 	}
 
-	fmt.Printf("Successfully uncompressed %s to temporary file\n", gzipFilePath)
+	if verbose {
+		if initialSize > 0 {
+			ratio := float64(written) / float64(initialSize)
+			fmt.Printf("Uncompressed %s: %.2f MB compressed to %.2f MB (%.1fx ratio)\n",
+				gzipFilePath, float64(initialSize)/(1024*1024), float64(written)/(1024*1024), ratio)
+		} else {
+			fmt.Printf("Successfully uncompressed %s to temporary file (%.2f MB)\n",
+				gzipFilePath, float64(written)/(1024*1024))
+		}
+	}
+
 	return tempFile.Name(), nil
 }
 
@@ -277,15 +364,21 @@ func buildBPFFilter(filter Filter) string {
 
 	// Filter by IP if specified
 	if filter.IPAddress != "" {
+		// Filter all traffic to/from the specified IP address
 		filters = append(filters, fmt.Sprintf("host %s", filter.IPAddress))
+		logVerbose("Using IP address filter for ALL traffic to/from %s\n", filter.IPAddress)
+	} else {
+		// No BPF filtering when no IP is specified - we'll check for SIP at the application level
+		logVerbose("No BPF filter applied - will check for SIP protocol at the application level\n")
+		return "" // Return empty string to indicate no BPF filter
 	}
 
-	// Always filter for potential SIP traffic (common SIP ports)
-	// SIP typically uses port 5060 for non-encrypted and 5061 for TLS
-	filters = append(filters, "(port 5060 or port 5061)")
+	// Combine all filters with AND if we have any
+	filterStr := strings.Join(filters, " and ")
 
-	// Combine all filters with AND
-	return strings.Join(filters, " and ")
+	logVerbose("Built BPF filter: %s\n", filterStr)
+
+	return filterStr
 }
 
 // processPCAP processes the PCAP file with the given filter using multiple workers
@@ -320,11 +413,13 @@ func processPCAP(filename string, filter Filter, numWorkers int) ([]PacketResult
 	if bpfFilter != "" {
 		err = handle.SetBPFFilter(bpfFilter)
 		if err != nil {
-			fmt.Printf("Warning: could not set BPF filter '%s': %v\n", bpfFilter, err)
+			logVerbose("Warning: could not set BPF filter '%s': %v\n", bpfFilter, err)
 			// Continue without the filter rather than failing
 		} else {
-			fmt.Printf("Using BPF filter: %s\n", bpfFilter)
+			logVerbose("Using BPF filter: %s\n", bpfFilter)
 		}
+	} else {
+		logVerbose("No BPF filter applied - examining all packets for SIP protocol\n")
 	}
 
 	// Create packet source
@@ -411,10 +506,13 @@ func processPCAPStreaming(filename string, filter Filter, outputFile string, num
 	if bpfFilter != "" {
 		err = handle.SetBPFFilter(bpfFilter)
 		if err != nil {
-			fmt.Printf("Warning: could not set BPF filter '%s': %v\n", bpfFilter, err)
+			logVerbose("Warning: could not set BPF filter '%s': %v\n", bpfFilter, err)
+			// Continue without the filter rather than failing
 		} else {
-			fmt.Printf("Using BPF filter: %s\n", bpfFilter)
+			logVerbose("Using BPF filter: %s\n", bpfFilter)
 		}
+	} else {
+		logVerbose("No BPF filter applied - examining all packets for SIP protocol\n")
 	}
 
 	// Create output file
@@ -520,6 +618,7 @@ func checkPacketMatch(packet gopacket.Packet, filter Filter) bool {
 	// Check for SIP layer - early exit if not present
 	sipLayer := packet.Layer(layers.LayerTypeSIP)
 	if sipLayer == nil {
+		// If no SIP layer and we're not filtering by IP address only, it's not a match
 		return false
 	}
 
@@ -533,6 +632,12 @@ func checkPacketMatch(packet gopacket.Packet, filter Filter) bool {
 		rawMsg := string(sip.Contents)
 		if !strings.Contains(rawMsg, filter.CallID) {
 			return false
+		}
+
+		if verbose {
+			// This is very verbose, so only log when callID is found and verbose
+			// is enabled, to help with debugging specific calls
+			logVerbose("Found packet with matching Call-ID: %s\n", filter.CallID)
 		}
 	}
 
@@ -573,8 +678,6 @@ func checkPacketMatch(packet gopacket.Packet, filter Filter) bool {
 			return false
 		}
 	}
-
-	// If we already checked Call-ID in the quick check and it passed, we don't need to check again
 
 	// If all filters passed, it's a match
 	return true
@@ -673,10 +776,16 @@ func processPCAPChunked(filename string, filter Filter, outputFile string, numWo
 	}
 
 	// First pass: count total packets in the file (for progress reporting)
-	totalPackets, err := countPacketsInFile(pcapPath)
-	if err != nil {
-		fmt.Printf("Warning: Unable to determine total packet count: %v\n", err)
-		totalPackets = 0 // Proceed without knowing the total
+	totalPackets := 0
+	if verbose {
+		fmt.Println("Counting packets in file for progress reporting...")
+		var err error
+		totalPackets, err = countPacketsInFile(pcapPath)
+		if err != nil {
+			fmt.Printf("Warning: Unable to determine total packet count: %v\n", err)
+		} else {
+			fmt.Printf("File contains a total of %d packets\n", totalPackets)
+		}
 	}
 
 	// Process the file in chunks
@@ -696,10 +805,12 @@ func processPCAPChunked(filename string, filter Filter, outputFile string, numWo
 		bpfFilter := buildBPFFilter(filter)
 		if bpfFilter != "" {
 			if err = handle.SetBPFFilter(bpfFilter); err != nil {
-				fmt.Printf("Warning: could not set BPF filter '%s': %v\n", bpfFilter, err)
+				logVerbose("Warning: could not set BPF filter '%s': %v\n", bpfFilter, err)
 			} else {
-				fmt.Printf("Using BPF filter: %s\n", bpfFilter)
+				logVerbose("Using BPF filter: %s\n", bpfFilter)
 			}
+		} else {
+			logVerbose("No BPF filter applied - examining all packets for SIP protocol\n")
 		}
 
 		// Create packet source with lazy decoding
@@ -757,8 +868,14 @@ func processPCAPChunked(filename string, filter Filter, outputFile string, numWo
 
 			// Report progress periodically
 			if processedPackets%10000 == 0 && totalPackets > 0 {
-				fmt.Printf("Progress: %d/%d packets (%.1f%%)\n",
-					processedPackets, totalPackets, float64(processedPackets)/float64(totalPackets)*100)
+				if verbose {
+					fmt.Printf("Progress: %d/%d packets (%.1f%%), Matches so far: %d\n",
+						processedPackets, totalPackets, float64(processedPackets)/float64(totalPackets)*100, len(currentChunk))
+				} else if totalPackets > 100000 {
+					// For large files, show minimal progress even in non-verbose mode
+					fmt.Printf("Progress: %.1f%%\r", float64(processedPackets)/float64(totalPackets)*100)
+					// No need to call Sync() on stdout, just make sure we're using carriage return
+				}
 			}
 
 			if packetsInThisChunk >= chunkSize {
@@ -777,6 +894,9 @@ func processPCAPChunked(filename string, filter Filter, outputFile string, numWo
 		// If we collected matches in this chunk, sort and save to temp file
 		if len(currentChunk) > 0 {
 			// Sort by timestamp
+			logVerbose("Sorting %d matching packets from chunk %d by timestamp\n",
+				len(currentChunk), chunkNumber+1)
+
 			sort.Slice(currentChunk, func(i, j int) bool {
 				return currentChunk[i].Packet.Metadata().Timestamp.Before(currentChunk[j].Packet.Metadata().Timestamp)
 			})
@@ -787,11 +907,19 @@ func processPCAPChunked(filename string, filter Filter, outputFile string, numWo
 				return 0, fmt.Errorf("error creating temp chunk file: %v", err)
 			}
 
+			logVerbose("Created temporary chunk file %s with %d packets\n",
+				tempFile, len(currentChunk))
+
 			tempFileMutex.Lock()
 			tempFiles = append(tempFiles, tempFile)
 			tempFileMutex.Unlock()
 
 			matchCount += len(currentChunk)
+			chunkNumber++
+
+			logVerbose("Completed chunk %d. Total matches so far: %d\n", chunkNumber, matchCount)
+		} else {
+			logVerbose("Chunk %d processed with no matching packets\n", chunkNumber+1)
 			chunkNumber++
 		}
 
@@ -809,9 +937,15 @@ func processPCAPChunked(filename string, filter Filter, outputFile string, numWo
 	}()
 
 	// Merge all temporary files using a priority queue to maintain order
-	err = mergeChunkFiles(tempFiles, writer)
-	if err != nil {
-		return 0, fmt.Errorf("error merging chunk files: %v", err)
+	if len(tempFiles) > 0 {
+		logVerbose("\nMerging %d chunk files into final output...\n", len(tempFiles))
+		err = mergeChunkFiles(tempFiles, writer)
+		if err != nil {
+			return 0, fmt.Errorf("error merging chunk files: %v", err)
+		}
+		logVerbose("Merge complete. Final output written to %s\n", outputFile)
+	} else {
+		logVerbose("No matching packets found in any chunk\n")
 	}
 
 	return matchCount, nil
@@ -918,7 +1052,9 @@ func mergeChunkFiles(files []string, writer *pcapgo.Writer) error {
 		return nil
 	}
 
-	fmt.Printf("Merging %d chunk files...\n", len(files))
+	if verbose {
+		fmt.Printf("Merging %d chunk files...\n", len(files))
+	}
 
 	// Create readers for each file
 	type chunkReader struct {
@@ -951,6 +1087,8 @@ func mergeChunkFiles(files []string, writer *pcapgo.Writer) error {
 			packets:  source.Packets(),
 			fileName: file,
 		}
+
+		logVerbose("Opened chunk file %d: %s\n", i+1, file)
 	}
 
 	// Make sure we close all readers when done
@@ -960,10 +1098,12 @@ func mergeChunkFiles(files []string, writer *pcapgo.Writer) error {
 				reader.handle.Close()
 			}
 		}
+		logVerbose("Closed all chunk file readers\n")
 	}()
 
 	// Initialize priority queue with the first packet from each file
 	pq := make(PriorityQueue, 0, len(files))
+	logVerbose("Initializing priority queue with first packet from each file...\n")
 
 	for i, reader := range readers {
 		if packet, more := <-reader.packets; more {
@@ -973,15 +1113,26 @@ func mergeChunkFiles(files []string, writer *pcapgo.Writer) error {
 				timestamp: packet.Metadata().Timestamp,
 				index:     i,
 			})
+			logVerbose("Added first packet from file %d (timestamp: %v)\n",
+				i+1, packet.Metadata().Timestamp)
+		} else {
+			logVerbose("File %d is empty\n", i+1)
 		}
 	}
 
 	// Only need to heapify if we have more than one file
 	if len(pq) > 1 {
 		heap.Init(&pq)
+		logVerbose("Initialized priority queue with %d packets\n", pq.Len())
 	}
 
 	// Merge the files by always taking the packet with the earliest timestamp
+	packetCount := 0
+	startTime := time.Now()
+	var lastUpdateTime time.Time
+
+	logVerbose("Beginning merge process...\n")
+
 	for pq.Len() > 0 {
 		// Get the earliest packet
 		item := heap.Pop(&pq).(*PacketItem)
@@ -991,6 +1142,8 @@ func mergeChunkFiles(files []string, writer *pcapgo.Writer) error {
 		if err != nil {
 			return fmt.Errorf("error writing merged packet: %v", err)
 		}
+
+		packetCount++
 
 		// Get the next packet from the same file
 		readerIndex := item.index
@@ -1003,6 +1156,21 @@ func mergeChunkFiles(files []string, writer *pcapgo.Writer) error {
 				index:     readerIndex,
 			})
 		}
+
+		// Log progress periodically
+		if verbose && (packetCount%10000 == 0 || time.Since(lastUpdateTime) > 5*time.Second) {
+			elapsedTime := time.Since(startTime)
+			packetsPerSec := float64(packetCount) / elapsedTime.Seconds()
+			fmt.Printf("Merged %d packets (%.1f packets/sec)\n", packetCount, packetsPerSec)
+			lastUpdateTime = time.Now()
+		}
+	}
+
+	if verbose {
+		elapsedTime := time.Since(startTime)
+		packetsPerSec := float64(packetCount) / elapsedTime.Seconds()
+		fmt.Printf("Merge complete: %d packets merged in %.2f seconds (%.1f packets/sec)\n",
+			packetCount, elapsedTime.Seconds(), packetsPerSec)
 	}
 
 	return nil
