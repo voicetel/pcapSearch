@@ -8,8 +8,10 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/gopacket"
@@ -33,6 +35,12 @@ type PacketResult struct {
 	Packet gopacket.Packet
 }
 
+// Constants for performance tuning
+const (
+	DefaultWorkers = 0 // 0 means use GOMAXPROCS
+	BatchSize      = 1000
+)
+
 func main() {
 	// Create a custom flagset that doesn't require flags to be before arguments
 	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
@@ -45,6 +53,8 @@ func main() {
 	ipAddr := fs.String("ip", "", "Filter by IP Address")
 	callID := fs.String("id", "", "Filter by Call ID")
 	outputFile := fs.String("o", "", "Output PCAP file (default: timestamp.pcap)")
+	workers := fs.Int("workers", DefaultWorkers, "Number of worker goroutines (0 = use all CPU cores)")
+	streamOutput := fs.Bool("stream", false, "Stream output directly to file (reduces memory usage)")
 
 	// Custom usage message
 	fs.Usage = func() {
@@ -99,16 +109,6 @@ func main() {
 		CallID:       *callID,
 	}
 
-	/* Print filter info for debugging
-	fmt.Println("Filter criteria:")
-	fmt.Printf("  Source Number: '%s'\n", filter.SourceNumber)
-	fmt.Printf("  Dest Number: '%s'\n", filter.DestNumber)
-	fmt.Printf("  User: '%s'\n", filter.User)
-	fmt.Printf("  User Agent: '%s'\n", filter.UserAgent)
-	fmt.Printf("  IP Address: '%s'\n", filter.IPAddress)
-	fmt.Printf("  Call ID: '%s'\n", filter.CallID)
-	*/
-
 	// Check if any filter was provided
 	if filter.isEmpty() {
 		fmt.Println("Error: No filter criteria specified")
@@ -116,35 +116,58 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("Processing PCAP file: %s\n", pcapFile)
+	// Set the number of workers
+	numWorkers := *workers
+	if numWorkers <= 0 {
+		numWorkers = runtime.GOMAXPROCS(0)
+	}
+
+	fmt.Printf("Processing PCAP file: %s with %d workers\n", pcapFile, numWorkers)
 	if strings.HasSuffix(strings.ToLower(pcapFile), ".gz") {
 		fmt.Println("Detected compressed gzip file - will uncompress automatically")
 	}
 
-	// Process the PCAP file
-	matchingPackets, err := processPCAP(pcapFile, filter)
-	if err != nil {
-		log.Fatalf("Error processing PCAP file: %v", err)
-	}
-
-	// Check if any matches were found
-	if len(matchingPackets) == 0 {
-		fmt.Println("Call(s) not found!")
-		os.Exit(1)
-	}
-
-	// Write matching packets to a temporary PCAP file
+	// Setting output file
 	tempPCAP := fmt.Sprintf("%d.pcap", time.Now().Unix())
 	if *outputFile != "" {
 		tempPCAP = *outputFile
 	}
 
-	err = writePacketsToFile(tempPCAP, matchingPackets)
-	if err != nil {
-		log.Fatalf("Error writing output PCAP: %v", err)
+	// Choose between memory-optimized streaming or in-memory processing
+	var matchCount int
+	var err error
+
+	startTime := time.Now()
+
+	if *streamOutput {
+		// Stream output directly to file (memory efficient)
+		matchCount, err = processPCAPStreaming(pcapFile, filter, tempPCAP, numWorkers)
+	} else {
+		// Process in memory (faster for smaller files)
+		var matchingPackets []PacketResult
+		matchingPackets, err = processPCAP(pcapFile, filter, numWorkers)
+		if err == nil {
+			matchCount = len(matchingPackets)
+			if matchCount > 0 {
+				err = writePacketsToFile(tempPCAP, matchingPackets)
+			}
+		}
 	}
 
-	fmt.Printf("Found %d matching packets. Output saved to %s\n", len(matchingPackets), tempPCAP)
+	processingTime := time.Since(startTime)
+
+	if err != nil {
+		log.Fatalf("Error processing PCAP file: %v", err)
+	}
+
+	// Check if any matches were found
+	if matchCount == 0 {
+		fmt.Println("Call(s) not found!")
+		os.Exit(1)
+	}
+
+	fmt.Printf("Found %d matching packets in %v. Output saved to %s\n",
+		matchCount, processingTime, tempPCAP)
 }
 
 // uncompressGzipFile takes a gzip file path and returns the path to a temporary
@@ -188,66 +211,101 @@ func uncompressGzipFile(gzipFilePath string) (string, error) {
 	fmt.Printf("Successfully uncompressed %s to temporary file\n", gzipFilePath)
 	return tempFile.Name(), nil
 }
+
 func (f Filter) isEmpty() bool {
 	return f.SourceNumber == "" && f.DestNumber == "" && f.User == "" && f.UserAgent == "" && f.IPAddress == "" && f.CallID == ""
 }
 
-// processPCAP processes the PCAP file with the given filter
-func processPCAP(filename string, filter Filter) ([]PacketResult, error) {
+// buildBPFFilter creates an optimized BPF filter based on available filter criteria
+func buildBPFFilter(filter Filter) string {
+	var filters []string
+
+	// Filter by IP if specified
+	if filter.IPAddress != "" {
+		filters = append(filters, fmt.Sprintf("host %s", filter.IPAddress))
+	}
+
+	// Always filter for potential SIP traffic (common SIP ports)
+	// SIP typically uses port 5060 for non-encrypted and 5061 for TLS
+	filters = append(filters, "(port 5060 or port 5061)")
+
+	// Combine all filters with AND
+	return strings.Join(filters, " and ")
+}
+
+// processPCAP processes the PCAP file with the given filter using multiple workers
+func processPCAP(filename string, filter Filter, numWorkers int) ([]PacketResult, error) {
 	var handle *pcap.Handle
 	var err error
 
 	// Check if the file is compressed with gzip
 	isCompressed := strings.HasSuffix(strings.ToLower(filename), ".gz")
 
+	var pcapPath string
 	if isCompressed {
 		// Create a temporary file to hold the uncompressed data
-		tempFile, err := uncompressGzipFile(filename)
+		pcapPath, err = uncompressGzipFile(filename)
 		if err != nil {
 			return nil, fmt.Errorf("error uncompressing gzip file: %v", err)
 		}
-		defer os.Remove(tempFile) // Clean up the temporary file when done
-
-		// Open the uncompressed temporary pcap file
-		handle, err = pcap.OpenOffline(tempFile)
+		defer os.Remove(pcapPath) // Clean up the temporary file when done
 	} else {
-		// Open the regular pcap file
-		handle, err = pcap.OpenOffline(filename)
+		pcapPath = filename
 	}
 
+	// Open the pcap file
+	handle, err = pcap.OpenOffline(pcapPath)
 	if err != nil {
 		return nil, fmt.Errorf("error opening pcap file: %v", err)
 	}
 	defer handle.Close()
 
-	// Set BPF filter for IP packets if an IP filter is provided
-	if filter.IPAddress != "" {
-		err = handle.SetBPFFilter(fmt.Sprintf("host %s", filter.IPAddress))
+	// Set BPF filter to reduce the number of packets processed
+	bpfFilter := buildBPFFilter(filter)
+	if bpfFilter != "" {
+		err = handle.SetBPFFilter(bpfFilter)
 		if err != nil {
-			return nil, fmt.Errorf("error setting BPF filter: %v", err)
+			fmt.Printf("Warning: could not set BPF filter '%s': %v\n", bpfFilter, err)
+			// Continue without the filter rather than failing
+		} else {
+			fmt.Printf("Using BPF filter: %s\n", bpfFilter)
 		}
 	}
 
-	// Create channels for packet processing
+	// Create packet source
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
-	packetChan := packetSource.Packets()
-	resultChan := make(chan PacketResult)
+	packetSource.DecodeOptions.Lazy = true // Enable lazy decoding for better performance
+	packetSource.DecodeOptions.NoCopy = true
+
+	// Create channels for parallel processing
+	packetChan := make(chan gopacket.Packet, BatchSize)
+	resultChan := make(chan PacketResult, BatchSize)
+	doneChan := make(chan struct{})
 
 	var wg sync.WaitGroup
-	wg.Add(1)
 
-	// Start worker goroutine to process packets
+	// Start worker goroutines
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			processPacketsWorker(packetChan, resultChan, filter)
+		}(i)
+	}
+
+	// Start a goroutine to close the result channel when all workers are done
 	go func() {
-		defer wg.Done()
-		for packet := range packetChan {
-			matchFound := processPacket(packet, filter)
-			if matchFound {
-				resultChan <- PacketResult{
-					Packet: packet,
-				}
-			}
-		}
+		wg.Wait()
 		close(resultChan)
+		close(doneChan)
+	}()
+
+	// Start a goroutine to feed packets to workers
+	go func() {
+		for packet := range packetSource.Packets() {
+			packetChan <- packet
+		}
+		close(packetChan)
 	}()
 
 	// Collect results
@@ -256,13 +314,141 @@ func processPCAP(filename string, filter Filter) ([]PacketResult, error) {
 		results = append(results, result)
 	}
 
-	wg.Wait()
+	<-doneChan // Wait for processing to complete
 	return results, nil
 }
 
-// processPacket processes a single packet and returns true if it matches the filter
-func processPacket(packet gopacket.Packet, filter Filter) bool {
-	// Check for SIP layer
+// processPCAPStreaming processes the PCAP file and streams matches directly to output file
+func processPCAPStreaming(filename string, filter Filter, outputFile string, numWorkers int) (int, error) {
+	var handle *pcap.Handle
+	var err error
+
+	// Check if the file is compressed with gzip
+	isCompressed := strings.HasSuffix(strings.ToLower(filename), ".gz")
+
+	var pcapPath string
+	if isCompressed {
+		// Create a temporary file to hold the uncompressed data
+		pcapPath, err = uncompressGzipFile(filename)
+		if err != nil {
+			return 0, fmt.Errorf("error uncompressing gzip file: %v", err)
+		}
+		defer os.Remove(pcapPath) // Clean up the temporary file when done
+	} else {
+		pcapPath = filename
+	}
+
+	// Open the pcap file
+	handle, err = pcap.OpenOffline(pcapPath)
+	if err != nil {
+		return 0, fmt.Errorf("error opening pcap file: %v", err)
+	}
+	defer handle.Close()
+
+	// Set BPF filter to reduce the number of packets processed
+	bpfFilter := buildBPFFilter(filter)
+	if bpfFilter != "" {
+		err = handle.SetBPFFilter(bpfFilter)
+		if err != nil {
+			fmt.Printf("Warning: could not set BPF filter '%s': %v\n", bpfFilter, err)
+		} else {
+			fmt.Printf("Using BPF filter: %s\n", bpfFilter)
+		}
+	}
+
+	// Create output file
+	f, err := os.Create(outputFile)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	// Create a pcap writer
+	writer := pcapgo.NewWriter(f)
+	err = writer.WriteFileHeader(65536, layers.LinkTypeEthernet)
+	if err != nil {
+		return 0, err
+	}
+
+	// Create packet source
+	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
+	packetSource.DecodeOptions.Lazy = true
+	packetSource.DecodeOptions.NoCopy = true
+
+	// Create channels for parallel processing
+	type writerJob struct {
+		ci   gopacket.CaptureInfo
+		data []byte
+	}
+
+	packetChan := make(chan gopacket.Packet, BatchSize)
+	matchChan := make(chan writerJob, BatchSize)
+	doneChan := make(chan struct{})
+
+	var matchCount atomic.Int32
+	var wgWorkers, wgWriter sync.WaitGroup
+
+	// Start the writer goroutine
+	wgWriter.Add(1)
+	go func() {
+		defer wgWriter.Done()
+		for job := range matchChan {
+			if err := writer.WritePacket(job.ci, job.data); err != nil {
+				fmt.Printf("Error writing packet: %v\n", err)
+			}
+		}
+	}()
+
+	// Start worker goroutines
+	for i := 0; i < numWorkers; i++ {
+		wgWorkers.Add(1)
+		go func(workerID int) {
+			defer wgWorkers.Done()
+			for packet := range packetChan {
+				if matchFound := checkPacketMatch(packet, filter); matchFound {
+					matchCount.Add(1)
+					matchChan <- writerJob{
+						ci:   packet.Metadata().CaptureInfo,
+						data: packet.Data(),
+					}
+				}
+			}
+		}(i)
+	}
+
+	// Start a goroutine to close channels when all workers are done
+	go func() {
+		wgWorkers.Wait()
+		close(matchChan)
+		wgWriter.Wait()
+		close(doneChan)
+	}()
+
+	// Feed packets to workers
+	for packet := range packetSource.Packets() {
+		packetChan <- packet
+	}
+	close(packetChan)
+
+	<-doneChan // Wait for processing to complete
+	return int(matchCount.Load()), nil
+}
+
+// processPacketsWorker processes packets from a channel and sends matches to resultChan
+func processPacketsWorker(packetChan <-chan gopacket.Packet, resultChan chan<- PacketResult, filter Filter) {
+	for packet := range packetChan {
+		if matchFound := checkPacketMatch(packet, filter); matchFound {
+			resultChan <- PacketResult{
+				Packet: packet,
+			}
+		}
+	}
+}
+
+// checkPacketMatch checks if a packet matches the filter criteria
+// This is an optimized version of the original processPacket function
+func checkPacketMatch(packet gopacket.Packet, filter Filter) bool {
+	// Check for SIP layer - early exit if not present
 	sipLayer := packet.Layer(layers.LayerTypeSIP)
 	if sipLayer == nil {
 		return false
@@ -273,7 +459,15 @@ func processPacket(packet gopacket.Packet, filter Filter) bool {
 		return false
 	}
 
-	// Get all SIP headers from the raw message
+	// Quick check for Call-ID filter (most specific and efficient)
+	if filter.CallID != "" {
+		rawMsg := string(sip.Contents)
+		if !strings.Contains(rawMsg, filter.CallID) {
+			return false
+		}
+	}
+
+	// Get all SIP headers from the raw message (only if we need them)
 	headerMap := extractSIPHeaders(sip)
 
 	// Apply source number filter
@@ -311,13 +505,7 @@ func processPacket(packet gopacket.Packet, filter Filter) bool {
 		}
 	}
 
-	// Apply Call-ID filter
-	if filter.CallID != "" {
-		callIDField := headerMap["Call-ID"]
-		if !strings.Contains(callIDField, filter.CallID) {
-			return false
-		}
-	}
+	// If we already checked Call-ID in the quick check and it passed, we don't need to check again
 
 	// If all filters passed, it's a match
 	return true
