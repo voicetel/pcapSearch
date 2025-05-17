@@ -83,19 +83,19 @@ Before you begin, make sure you have the following software installed:
    go get github.com/google/gopacket/pcapgo
    ```
 4. Set environment variables to locate Npcap/WinPcap:
-   
+
    For Npcap (64-bit):
    ```
    set CGO_CFLAGS=-I"C:\Program Files\Npcap\Include"
    set CGO_LDFLAGS=-L"C:\Program Files\Npcap\Lib\x64" -lwpcap
    ```
-   
+
    For Npcap (32-bit):
    ```
    set CGO_CFLAGS=-I"C:\Program Files\Npcap\Include"
    set CGO_LDFLAGS=-L"C:\Program Files\Npcap\Lib" -lwpcap
    ```
-   
+
    For WinPcap:
    ```
    set CGO_CFLAGS=-I"C:\WinPcap\Include"
@@ -118,6 +118,40 @@ The syntax for running pcapSearch on Windows is the same as on other platforms:
 
 ```
 pcapSearch.exe [options] file.pcap|file.pcapng|file.pcap.gz
+```
+
+### Available Options
+
+```
+  -auto
+        Automatically select the best mode based on file size (default: true)
+  -chunk
+        Use chunked processing for very large files (lowest memory usage)
+  -chunk-size int
+        Number of packets per chunk in chunk mode (default 100000)
+  -dst string
+        Filter by Destination Number (number in the To: header)
+  -force-mode
+        Force the specified mode instead of auto-selecting based on file size
+  -id string
+        Filter by Call ID (in Call-ID: header)
+  -ip string
+        Filter by IP Address (source or destination)
+  -o string
+        Output PCAP file (default: timestamp.pcap)
+  -split
+        Split output into separate files by Call-ID
+  -src string
+        Filter by Source Number (number in From: or P-Asserted-Identity: header)
+  -stream
+        Stream output directly to file (reduces memory usage)
+  -ua string
+        Filter by User Agent (in User-Agent: header)
+  -usr string
+        Filter by User (in Contact: header)
+  -v    Verbose mode: display detailed processing information
+  -workers string
+        Number of worker goroutines (0 = use all CPU cores, N% = use percentage of cores)
 ```
 
 ### Examples

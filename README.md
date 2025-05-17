@@ -86,6 +86,8 @@ Windows [instructions](windows.md).
     	Filter by IP Address
   -o string
     	Output PCAP file (default: timestamp.pcap)
+  -split
+      Split output into separate files by Call-ID
   -src string
     	Filter by SRC Number
   -stream
