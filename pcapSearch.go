@@ -75,7 +75,7 @@ func main() {
 
 	// Custom usage message
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [options] file.pcap|file.pcapng|file.pcap.gz|file.pcapng.gz\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s file.pcap [options]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		fs.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nSupported file formats: .pcap, .pcapng, .pcap.gz, .pcapng.gz, .gz\n")
