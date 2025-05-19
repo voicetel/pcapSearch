@@ -192,6 +192,16 @@ pcapSearch offers three processing modes, automatically selected based on file s
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) for details.
 
-## Contributing
+## 🙌 Contributors
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+We welcome, acknowlege, and appreciate contributors. Thanks to these awesome people for making this project possible:
+
+[Michael Mavroudis](https://github.com/mavroudis)
+
+## 💖 Sponsors
+
+We gratefully acknowledge the support of our amazing sponsors:
+
+| Sponsor | Contribution |
+|---------|--------------|
+| [VoiceTel Communications](http://www.voicetel.com) | Everything :) |
