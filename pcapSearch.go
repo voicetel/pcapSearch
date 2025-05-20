@@ -237,6 +237,12 @@ func (f Filter) isEmpty() bool {
 	return f.SourceNumber == "" && f.DestNumber == "" && f.User == "" && f.UserAgent == "" && f.IPAddress == "" && f.CallID == ""
 }
 
+// isOnlyIPFilter checks if only the IP address filter is set and no other SIP filters
+func (f Filter) isOnlyIPFilter() bool {
+	return f.IPAddress != "" && f.SourceNumber == "" && f.DestNumber == "" &&
+		f.User == "" && f.UserAgent == "" && f.CallID == ""
+}
+
 // buildBPFFilter creates an optimized BPF filter based on available filter criteria
 func buildBPFFilter(filter Filter) string {
 	var filters []string
@@ -295,6 +301,17 @@ func processPacketsWorker(packetChan <-chan gopacket.Packet, resultChan chan<- P
 				Packet: packet,
 				CallID: callID,
 			}
+		}
+	}
+}
+
+// processIPFilterWorker processes packets using only BPF IP filter without SIP analysis
+func processIPFilterWorker(packetChan <-chan gopacket.Packet, resultChan chan<- PacketResult) {
+	for packet := range packetChan {
+		// When using only IP filter, all packets passing BPF are matches
+		resultChan <- PacketResult{
+			Packet: packet,
+			CallID: "", // No Call-ID since we're skipping SIP analysis
 		}
 	}
 }
@@ -876,7 +893,12 @@ func processPCAP(filename string, filter Filter, numWorkers int) ([]PacketResult
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			processPacketsWorker(packetChan, resultChan, filter)
+			// Use different worker function based on filter type
+			if filter.isOnlyIPFilter() {
+				processIPFilterWorker(packetChan, resultChan)
+			} else {
+				processPacketsWorker(packetChan, resultChan, filter)
+			}
 		}(i)
 	}
 
@@ -993,14 +1015,28 @@ func processPCAPStreaming(filename string, filter Filter, outputFile string, num
 			defer wg.Done()
 			var localMatches []matchResult
 
-			for packet := range packetChan {
-				if matchFound := checkPacketMatch(packet, filter); matchFound {
+			// Check if we're using only IP filter or full SIP filter
+			if filter.isOnlyIPFilter() {
+				// For IP-only filter, all packets passing BPF are matches
+				for packet := range packetChan {
 					localMatches = append(localMatches, matchResult{
 						ci:             packet.Metadata().CaptureInfo,
 						data:           packet.Data(),
 						timestamp:      packet.Metadata().Timestamp,
 						originalPacket: packet,
 					})
+				}
+			} else {
+				// For SIP filter, check each packet against SIP criteria
+				for packet := range packetChan {
+					if matchFound := checkPacketMatch(packet, filter); matchFound {
+						localMatches = append(localMatches, matchResult{
+							ci:             packet.Metadata().CaptureInfo,
+							data:           packet.Data(),
+							timestamp:      packet.Metadata().Timestamp,
+							originalPacket: packet,
+						})
+					}
 				}
 			}
 
@@ -1031,7 +1067,7 @@ func processPCAPStreaming(filename string, filter Filter, outputFile string, num
 	})
 
 	// Write the sorted results to the file
-	if splitByCallID {
+	if splitByCallID && !filter.isOnlyIPFilter() {
 		// Group results by Call-ID
 		callIDGroups := make(map[string][]matchResult)
 		unknownCallIDCount := 0
@@ -1212,11 +1248,23 @@ func processPCAPChunked(filename string, filter Filter, outputFile string, numWo
 			wg.Add(1)
 			go func(workerID int) {
 				defer wg.Done()
-				for packet := range packetChan {
-					if matchFound := checkPacketMatch(packet, filter); matchFound {
+				// Use different worker based on filter type
+				if filter.isOnlyIPFilter() {
+					// For IP-only filter, all packets passing BPF are matches
+					for packet := range packetChan {
 						resultChan <- PacketResult{
 							Packet: packet,
-							CallID: extractCallIDFromPacket(packet),
+							CallID: "", // No Call-ID extraction for IP-only filter
+						}
+					}
+				} else {
+					// For SIP filter, check each packet against criteria
+					for packet := range packetChan {
+						if matchFound := checkPacketMatch(packet, filter); matchFound {
+							resultChan <- PacketResult{
+								Packet: packet,
+								CallID: extractCallIDFromPacket(packet),
+							}
 						}
 					}
 				}
@@ -1309,7 +1357,7 @@ func processPCAPChunked(filename string, filter Filter, outputFile string, numWo
 	}()
 
 	// Merge all temporary files using a priority queue to maintain order
-	if splitByCallID {
+	if splitByCallID && !filter.isOnlyIPFilter() {
 		// Handle chunked mode with splitting by Call-ID
 		// This involves more complex merging logic as we need to maintain Call-ID groups
 		if len(tempFiles) > 0 {
@@ -1445,6 +1493,11 @@ func main() {
 		fmt.Printf("  User Agent: '%s'\n", filter.UserAgent)
 		fmt.Printf("  IP Address: '%s'\n", filter.IPAddress)
 		fmt.Printf("  Call ID: '%s'\n", filter.CallID)
+
+		// Log if we're using IP-only mode
+		if filter.isOnlyIPFilter() {
+			fmt.Println("\nUsing IP-only filter mode: BPF filter only, no SIP analysis")
+		}
 	}
 
 	// Convert workers from string to int, handling auto and percentage modes
@@ -1566,7 +1619,7 @@ func main() {
 		if err == nil {
 			matchCount = len(matchingPackets)
 			if matchCount > 0 {
-				if *splitByCall {
+				if *splitByCall && !filter.isOnlyIPFilter() {
 					err = writePacketsToFilesBySplitCallID(tempPCAP, matchingPackets)
 				} else {
 					err = writePacketsToFile(tempPCAP, matchingPackets)
@@ -1587,7 +1640,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	if !*splitByCall {
+	if !*splitByCall || filter.isOnlyIPFilter() {
 		fmt.Printf("Found %d matching packets in %v. Output saved to %s\n",
 			matchCount, processingTime, tempPCAP)
 	} // If split mode is used, the output message is already printed by the split function
