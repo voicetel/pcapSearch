@@ -62,7 +62,7 @@ Before you begin, make sure you have the following software installed:
 1. Install Git from [https://git-scm.com/download/win](https://git-scm.com/download/win)
 2. Open Command Prompt and run:
    ```
-   git clone https://github.com/yourusername/pcapSearch.git
+   git clone https://github.com/voicetel/pcapSearch.git
    cd pcapSearch
    ```
 
